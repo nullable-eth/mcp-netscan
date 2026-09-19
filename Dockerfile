@@ -13,10 +13,11 @@ RUN set -eux; \
     ver="$(curl -fsSL https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
            | grep -Po '"tag_name":\s*"v\K[^"]+')"; \
     base="https://github.com/projectdiscovery/nuclei/releases/download/v${ver}"; \
-    curl -fsSL -o /tmp/n.zip "${base}/nuclei_${ver}_linux_amd64.zip"; \
+    zip="nuclei_${ver}_linux_amd64.zip"; \
+    curl -fsSL -o "/tmp/${zip}" "${base}/${zip}"; \
     curl -fsSL -o /tmp/sums.txt "${base}/nuclei_${ver}_checksums.txt"; \
-    (cd /tmp && grep "nuclei_${ver}_linux_amd64.zip" sums.txt | sha256sum -c -); \
-    unzip -o /tmp/n.zip nuclei -d /usr/local/bin; \
+    (cd /tmp && grep "${zip}" sums.txt | sha256sum -c -); \
+    unzip -o "/tmp/${zip}" nuclei -d /usr/local/bin; \
     /usr/local/bin/nuclei -version
 RUN git clone --depth 1 \
       https://github.com/projectdiscovery/nuclei-templates /opt/nuclei-templates \
