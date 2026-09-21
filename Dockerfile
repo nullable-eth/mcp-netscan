@@ -1,11 +1,10 @@
-FROM python:3.13-slim AS build
-WORKDIR /src
-COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+# syntax=docker/dockerfile:1
 
-# nuclei binary (latest release, checksum-verified) and its templates (pinned to
-# a shallow clone at build time, so the running pod never fetches templates over
-# its open egress).
+# --- tools stage -------------------------------------------------------------
+# nuclei (pinned to the latest release, checksum-verified) and its templates
+# (cloned at build time, so the running pod never fetches templates over its
+# egress), plus kubectl for the exit-controller command mode. Built on slim so
+# this stage stays quick and cache-friendly.
 FROM debian:bookworm-slim AS tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
       curl unzip git ca-certificates && rm -rf /var/lib/apt/lists/*
@@ -19,7 +18,6 @@ RUN set -eux; \
     (cd /tmp && grep "${zip}" sums.txt | sha256sum -c -); \
     unzip -o "/tmp/${zip}" nuclei -d /usr/local/bin; \
     /usr/local/bin/nuclei -version
-# kubectl (checksum-verified) — used only by the exit-controller role.
 RUN set -eux; \
     kver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; \
     curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${kver}/bin/linux/amd64/kubectl"; \
@@ -31,20 +29,37 @@ RUN git clone --depth 1 \
  && rm -rf /opt/nuclei-templates/.git \
  && chmod -R a+rX /opt/nuclei-templates
 
-FROM python:3.13-slim
-# nmap/sslscan for the scanner; wireguard-tools (wg keygen) for the controller.
+# --- runtime image -----------------------------------------------------------
+# Official Kali + the "large" tool metapackage: every Kali recon AND
+# exploitation tool is present when an operator execs into the pod. Kali
+# maintains that tool list, so this Dockerfile stays a thin layer with nothing
+# to hand-curate. Which of these the AGENT may drive is a separate, code-level
+# allow-list (netscan/arsenal.py) enforced by run_tool; the rest are here for
+# manual `kubectl exec` use only.
+FROM kalilinux/kali-rolling
+ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      nmap sslscan wireguard-tools ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=build /install /usr/local
+      kali-linux-large wireguard-tools python3 python3-venv ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Our MCP server's Python deps live in their own venv, isolated from Kali's
+# system Python (which many of the tools themselves use).
+COPY requirements.txt /tmp/requirements.txt
+RUN python3 -m venv /opt/venv \
+ && /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+
 COPY --from=tools /usr/local/bin/nuclei /usr/local/bin/nuclei
 COPY --from=tools /usr/local/bin/kubectl /usr/local/bin/kubectl
 COPY --from=tools /opt/nuclei-templates /opt/nuclei-templates
 COPY netscan/ /srv/netscan/
 WORKDIR /srv
-# HOME must be writable for nuclei's runtime cache; the templates are read-only.
-ENV HOME=/tmp PORT=8080 PYTHONUNBUFFERED=1
-USER 65534
+ENV PATH=/opt/venv/bin:$PATH HOME=/tmp PORT=8080 PYTHONUNBUFFERED=1
 EXPOSE 8080
-# Default = the MCP scanner server. The exit-controller Deployment overrides
-# command with: ["python","-m","netscan.exit_controller"].
+
+# Runs as root: raw-socket recon (masscan, nmap -sS, arp-scan) needs it, and the
+# pod is already strongly contained — fail-closed WireGuard egress, no cluster
+# credentials, one scan at a time, argv-only exec. The scanner Deployment
+# tightens this with a securityContext (cap drop-all but NET_RAW, no privilege
+# escalation); the exit-controller Deployment overrides USER to non-root 65534
+# and command to ["python","-m","netscan.exit_controller"].
 CMD ["python", "-m", "netscan.server"]
