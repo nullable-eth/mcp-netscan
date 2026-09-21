@@ -7,6 +7,8 @@ every scan carries a transmit-rate cap and a timeout.
 """
 from __future__ import annotations
 
+import os
+import pathlib
 import xml.etree.ElementTree as ET
 
 from . import runner, validate
@@ -49,33 +51,69 @@ async def port_scan(target: str, *, ports: str = "", top_ports: int = 100,
 
 
 async def vuln_scan(target: str, *, ports: str = "", top_ports: int = 100,
-                    max_rate: int = 300, timeout: float = 600.0) -> dict:
-    """nmap service scan plus the NSE 'vuln' category, with the denial-of-
-    service, exploit, and brute-force scripts excluded. Detection only."""
+                    max_rate: int = 300, timeout: float = 300.0) -> dict:
+    """Two-phase, hard-bounded NSE 'vuln' detection (denial-of-service, exploit
+    and brute-force scripts excluded; detection only).
+
+    Phase 1 finds the open ports quickly; phase 2 runs -sV plus the vuln scripts
+    ONLY on those, under an nmap --host-timeout. The NSE vuln scripts (HTTP
+    enumeration especially) are slow, so without this a scan runs for many
+    minutes and overruns the caller's tool-call timeout. Bounded, it always
+    returns within the budget with whatever it found (partial when it ran long).
+    """
     tgt = validate.normalize_target(target)
-    argv = ["nmap", "-sT", "-Pn", "-n", "-sV", "--max-rate",
-            _rate(max_rate, 300, MAX_RATE_HARD),
-            "--script", "vuln and not (dos or exploit or brute)",
-            "--script-timeout", "120s"]
+    budget = min(float(timeout), 900.0)
+    rate = _rate(max_rate, 300, MAX_RATE_HARD)
     p = validate.normalize_ports(ports)
-    argv += ["-p", p] if p else ["--top-ports", str(max(1, min(int(top_ports), 65535)))]
-    argv += ["-oX", "-", tgt]
-    rc, out, err = await runner.run(argv, timeout=min(timeout, 1200.0))
+    portsel = ["-p", p] if p else ["--top-ports", str(max(1, min(int(top_ports), 65535)))]
+
+    # Phase 1: quick open-port discovery (seconds).
+    disc = ["nmap", "-sT", "-Pn", "-n", "--max-rate", rate, "-T4",
+            *portsel, "-oX", "-", tgt]
+    rc, out, err = await runner.run(disc, timeout=min(budget, 60.0))
+    discovered = _parse_nmap(out)
+    open_ports = sorted({pt["port"] for h in discovered["hosts"]
+                         for pt in h["ports"] if pt.get("state") == "open"})
+    if not open_ports:
+        discovered["target"] = tgt
+        discovered["note"] = "no open TCP ports found; nothing to vuln-scan"
+        if not discovered["hosts"] and err:
+            discovered["error"] = err.strip()[:500]
+        return discovered
+
+    # Phase 2: version + vuln scripts on the open ports only, hard-bounded so a
+    # slow script set cannot overrun the caller. nmap returns what it completed
+    # before the host-timeout fires.
+    host_to = max(60, int(budget * 0.9))
+    argv = ["nmap", "-sT", "-Pn", "-n", "-sV", "--version-intensity", "5",
+            "--max-rate", rate,
+            "--script", "vuln and not (dos or exploit or brute)",
+            "--script-timeout", "60s", "--host-timeout", f"{host_to}s",
+            "-p", ",".join(str(x) for x in open_ports), "-oX", "-", tgt]
+    rc, out, err = await runner.run(argv, timeout=min(budget, 900.0))
     result = _parse_nmap(out)
     result["target"] = tgt
+    result["open_ports_scanned"] = open_ports
     if not result["hosts"] and err:
         result["error"] = err.strip()[:500]
     return result
 
 
 async def web_scan(url: str, *, severity: str = "", rate: int = 150,
-                   concurrency: int = 25, timeout: float = 600.0) -> dict:
+                   concurrency: int = 25, timeout: float = 480.0) -> dict:
     """nuclei against one http(s) target with the bundled templates. The
     denial-of-service tag is excluded and out-of-band (interactsh) probing is
-    off, so no traffic leaves toward a third-party OOB server."""
+    off, so no traffic leaves toward a third-party OOB server. Findings are
+    written to a file as they are found, so if the run hits its timeout the
+    partial results are still returned instead of an error."""
     safe_url, host = validate.normalize_url(url)
-    argv = ["nuclei", "-u", safe_url, "-jsonl", "-silent", "-disable-update-check",
-            "-no-interactsh", "-templates", NUCLEI_TEMPLATES,
+    out_path = f"/tmp/nuclei-{os.getpid()}.jsonl"
+    try:
+        pathlib.Path(out_path).unlink()
+    except OSError:
+        pass
+    argv = ["nuclei", "-u", safe_url, "-jsonl", "-o", out_path, "-silent",
+            "-disable-update-check", "-no-interactsh", "-templates", NUCLEI_TEMPLATES,
             "-rl", _rate(rate, 150, NUCLEI_RATE_HARD),
             "-c", str(max(1, min(int(concurrency), 50))),
             "-timeout", "10", "-retries", "1", "-etags", "dos"]
@@ -85,11 +123,18 @@ async def web_scan(url: str, *, severity: str = "", rate: int = 150,
         wanted = ",".join(s for s in sev.split(",") if s in allowed)
         if wanted:
             argv += ["-severity", wanted]
-    rc, out, err = await runner.run(argv, timeout=min(timeout, 1200.0),
-                                    stdin=None)
-    findings = _parse_nuclei(out)
+    partial, err = False, ""
+    try:
+        rc, out, err = await runner.run(argv, timeout=min(float(timeout), 900.0))
+    except runner.ScanError:
+        partial = True   # timed out; whatever nuclei wrote so far is still useful
+    try:
+        text = pathlib.Path(out_path).read_text()
+    except OSError:
+        text = ""
+    findings = _parse_nuclei(text)
     res = {"url": safe_url, "host": host, "findings": findings,
-           "finding_count": len(findings)}
+           "finding_count": len(findings), "partial": partial}
     if not findings and err.strip():
         res["stderr"] = err.strip()[:500]
     return res
