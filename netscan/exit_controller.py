@@ -12,9 +12,10 @@ Config via env (see the Deployment):
   FW_GROUP        name of the FirewallGroup MR to attach
   NETSCAN_NS/DEPLOY/PEER_SECRET  where to write the peer + restart the scanner
   PROVIDER_CONFIG Crossplane ProviderConfig name (default: default)
-Verification is pod-readiness based: after writing the peer secret and
-restarting the scanner, we wait for the netscan pod to become Ready. Ready =
-gluetun's tunnel is up. Not ready in time = handshake failed = reprovision.
+Verification checks the scanner's real egress IP: after writing the peer secret
+and restarting the scanner, we exec the netscan container and confirm its public
+IP is the box IP. Pod-readiness is NOT a proxy — the gluetun killswitch keeps the
+pod Ready even when the tunnel is down.
 """
 import base64
 import json
@@ -43,11 +44,21 @@ def log(msg):
     print(f"[exit-controller] {msg}", flush=True)
 
 
-def kubectl(args, stdin=None, check=True):
-    p = subprocess.run(["kubectl", *args], input=stdin, capture_output=True, text=True)
-    if check and p.returncode != 0:
-        raise RuntimeError(f"kubectl {' '.join(args)} failed: {p.stderr.strip()}")
-    return p.stdout.strip()
+def kubectl(args, stdin=None, check=True, retries=6):
+    # At pod start the API can be briefly unreachable while the CNI programs this
+    # pod's NetworkPolicy (seen as "dial 10.43.0.1:443: connection refused"),
+    # which used to crash the controller on its first apply. Retry check=True
+    # calls with a short backoff; check=False callers (pollers) handle their own.
+    last = ""
+    for _ in range(max(1, retries)):
+        p = subprocess.run(["kubectl", *args], input=stdin, capture_output=True, text=True)
+        if p.returncode == 0:
+            return p.stdout.strip()
+        last = p.stderr.strip()
+        if not check:
+            return p.stdout.strip()
+        time.sleep(3)
+    raise RuntimeError(f"kubectl {' '.join(args)} failed after {retries} tries: {last}")
 
 
 def wg_keypair():
@@ -77,12 +88,21 @@ PublicKey = {SCANNER_PUB}
 AllowedIPs = 10.9.0.2/32
 WG
 chmod 600 /etc/wireguard/wg0.conf
+# Vultr base images (Alpine included) ship UFW with a default-DROP INPUT chain,
+# which silently drops the inbound WireGuard handshake before it ever reaches
+# wg0 — the box receives the packet at the NIC but never replies, so the tunnel
+# never comes up. Open the listen port explicitly (the Vultr cloud firewall
+# group already restricts inbound to UDP 51820, so this is not widening exposure).
+iptables -I INPUT 1 -p udp --dport 51820 -j ACCEPT
 wg-quick up wg0
 """
 
 
 def apply(manifest):
-    kubectl(["apply", "-f", "-"], stdin=json.dumps(manifest))
+    # --validate=false skips kubectl's openapi/v2 download (an extra API round
+    # trip that was the first thing to fail at pod start); the apply itself still
+    # goes through the API and is server-side validated.
+    kubectl(["apply", "--validate=false", "-f", "-"], stdin=json.dumps(manifest))
 
 
 def apply_box(region, box_priv):
@@ -127,14 +147,22 @@ def restart_scanner():
     kubectl(["rollout", "restart", f"deploy/{DEPLOY}", "-n", NS])
 
 
-def scanner_ready(timeout=100):
+def verify_tunnel(ip, timeout=120):
+    # Confirm the scanner actually egresses through the box. Pod-readiness is NOT
+    # a proxy any more: the gluetun killswitch keeps the pod Ready even with the
+    # tunnel down, so check the scanner's real public IP == the box IP.
     deadline = time.time() + timeout
     while time.time() < deadline:
-        out = kubectl(["rollout", "status", f"deploy/{DEPLOY}", "-n", NS,
-                       "--timeout=10s"], check=False)
-        if "successfully rolled out" in out:
-            return True
-        time.sleep(5)
+        pod = kubectl(["get", "pod", "-n", NS, "-l", f"app={DEPLOY}",
+                       "--field-selector=status.phase=Running",
+                       "-o", "jsonpath={.items[0].metadata.name}"], check=False)
+        if pod:
+            out = kubectl(["exec", "-n", NS, pod, "-c", "netscan", "--",
+                           "curl", "-s", "--max-time", "10", "https://api.ipify.org"],
+                          check=False)
+            if out.strip() == ip:
+                return True
+        time.sleep(6)
     return False
 
 
@@ -163,10 +191,10 @@ def bring_up():
         log(f"box up at {ip}; wiring scanner and verifying tunnel")
         set_peer(ip, box_pub)
         restart_scanner()
-        if scanner_ready():
-            log(f"tunnel UP — scans now exit {ip} ({region}). Holding box up.")
+        if verify_tunnel(ip):
+            log(f"tunnel UP — scanner public IP is {ip} ({region}). Holding box up.")
             return True
-        log("scanner did not become ready (handshake failed) — reprovisioning")
+        log("tunnel did not verify (scanner not egressing via the box) — reprovisioning")
         teardown()
     log(f"gave up after {MAX_TRIES} tries. If provisioning kept failing, check "
         f"Vultr credit: {BILLING}")
