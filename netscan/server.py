@@ -11,7 +11,8 @@ import os
 
 from mcp.server.fastmcp import FastMCP
 
-from . import tools
+from . import arsenal, tools
+from .arsenal import ToolError
 from .runner import ScanError
 from .validate import TargetError
 
@@ -29,7 +30,7 @@ mcp = FastMCP(
 async def _call(kind: str, coro):
     try:
         return json.dumps(await coro, default=str)
-    except (TargetError, ScanError) as e:
+    except (TargetError, ScanError, ToolError) as e:
         return json.dumps({"error": str(e)})
     except Exception as e:  # never leak a traceback to the model
         log.exception("%s failed", kind)
@@ -88,6 +89,45 @@ async def tls_scan(target: str, port: int = 443) -> str:
     you own or are explicitly authorised to test.
     """
     return await _call("tls_scan", tools.tls_scan(target, port=port))
+
+
+@mcp.tool()
+async def list_arsenal() -> str:
+    """List every command-line tool the agent may run through run_tool, grouped
+    by category, with a one-line description each. Use this to discover what is
+    available before calling run_tool. Exploitation frameworks and
+    credential-attack tools are installed on the image but are NOT listed here
+    and cannot be run by the agent (operator-only, via kubectl exec).
+    """
+    return await _call("list_arsenal", _wrap(arsenal.list_arsenal()))
+
+
+@mcp.tool()
+async def run_tool(tool: str, args: list[str] | None = None,
+                   timeout: float = 300.0) -> str:
+    """Run one allow-listed Kali recon/assessment tool with its NATIVE flags and
+    return its raw output. This is the generic escape hatch: craft any invocation
+    of an allowed tool as (tool, args) instead of looking for a bespoke wrapper.
+
+    tool is a bare binary name that must be on the allow-list (see list_arsenal);
+    args is its argument vector as a list of strings, e.g.
+    run_tool("nmap", ["-sV", "--script", "http-title", "-p", "80,443", "10.0.0.5"]).
+    Execution is argv-only (no shell is involved, so quoting/metacharacters are
+    never interpreted), one tool at a time, with output capped and a timeout
+    (default 300s, max 900s). returncode, stdout and stderr are returned as-is.
+
+    Allowed: recon, enumeration, web/TLS assessment, and vulnerability detection
+    (including sqlmap and nmap NSE). Not allowed: Metasploit, hydra/medusa/
+    ncrack, john/hashcat, netexec, responder, ettercap/bettercap — these are
+    present for manual operator use only. Only scan hosts you own or are
+    explicitly authorised to test.
+    """
+    return await _call("run_tool", arsenal.run_tool(tool, args, timeout=timeout))
+
+
+async def _wrap(value):
+    """Adapt a plain (non-coroutine) result to the _call(await coro) contract."""
+    return value
 
 
 def main() -> None:
