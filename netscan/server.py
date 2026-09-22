@@ -24,6 +24,11 @@ mcp = FastMCP(
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", "8080")),
     streamable_http_path="/mcp",
+    # Stateless: a multiplexing MCP gateway (agentgateway) fans out tools/list on
+    # a cached session id; FastMCP's default stateful mode drops idle sessions,
+    # after which every fanout 404s and the gateway silently drops this upstream.
+    # Stateless has no session to lose — each call is self-contained.
+    stateless_http=True,
 )
 
 
