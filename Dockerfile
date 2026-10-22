@@ -37,6 +37,11 @@ RUN git clone --depth 1 \
 # allow-list (netscan/arsenal.py) enforced by run_tool; the rest are here for
 # manual `kubectl exec` use only.
 FROM kalilinux/kali-rolling
+# eMudhra CA compromise (20 Oct 26): eight eMudhra intermediate keys are
+# derivable from their certificates. Take the distro's fixed ca-certificates
+# even when the base image predates it.
+RUN apt-get update && apt-get install -y --no-install-recommends --only-upgrade ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       kali-linux-large wireguard-tools python3 python3-venv ca-certificates \
@@ -62,4 +67,8 @@ EXPOSE 8080
 # tightens this with a securityContext (cap drop-all but NET_RAW, no privilege
 # escalation); the exit-controller Deployment overrides USER to non-root 65534
 # and command to ["python","-m","netscan.exit_controller"].
+# certifi >= 2026.10.19 drops the compromised roots; requests/httpx use it,
+# not the OS store.
+RUN pip install --no-cache-dir -U "certifi>=2026.10.19"
+
 CMD ["python", "-m", "netscan.server"]
